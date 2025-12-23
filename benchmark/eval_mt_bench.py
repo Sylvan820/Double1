@@ -44,6 +44,13 @@ class EvalMTBench(Decoding):
         else:
             raise NotImplementedError
 
+        # Initialize retrieval cache if enabled
+        if getattr(args, 'use_retrieval_cache', False):
+            self.init_retrieval_cache(
+                ngram_n=getattr(args, 'retrieval_ngram_n', 2),
+                max_cache_size=getattr(args, 'retrieval_max_cache_size', 100000)
+            )
+
     def load_data(self):
         # * load evaluation data
         self.color_print(f"Loading MT-bench data...", 3)
@@ -140,11 +147,19 @@ class EvalMTBench(Decoding):
                         prompt = conv.get_prompt() + " "
                         input_ids = torch.tensor(self.tokenizer.encode(prompt)).unsqueeze(0)
 
+                    # Start retrieval cache task
+                    if self._use_retrieval_cache:
+                        self.on_task_start()
+
                     torch.cuda.synchronize()
                     start_time = time.time()
                     output_ids = decoding(input_ids)
                     torch.cuda.synchronize()
                     end_time = time.time()
+                    
+                    # End retrieval cache task
+                    if self._use_retrieval_cache:
+                        self.on_task_end(output_ids, input_ids.shape[1])
                     
                     output_text = self.tokenizer.decode(output_ids[0], spaces_between_special_tokens=False)
                     
@@ -223,6 +238,12 @@ class EvalMTBench(Decoding):
                 self.color_print(f"Mean accepted tokens: {sum(self.num_acc_tokens) / len(self.num_acc_tokens)}")
             except:
                 pass
+        
+        # Print retrieval cache statistics and save if enabled
+        if self._use_retrieval_cache and self.accelerator.is_main_process:
+            self.print_retrieval_stats()
+            if getattr(self.args, 'save_retrieval_cache', False):
+                self.save_retrieval_cache(f"mt_bench_{self.args.eval_mode}")
         
 
 if __name__ == "__main__":
