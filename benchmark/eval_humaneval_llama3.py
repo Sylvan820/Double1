@@ -21,6 +21,24 @@ class EvalHumaneval(Decoding):
         self.load_tokenizer()
         self.load_data()
         self.load_model()
+        
+        # 初始化检索库（如果启用）
+        if getattr(args, 'use_retrieval_cache', False):
+            load_from = getattr(args, 'retrieval_cache_name', None)
+            if load_from and load_from != 'new':
+                self.init_retrieval_cache(
+                    cache_dir=getattr(args, 'retrieval_cache_dir', './retrieval_cache'),
+                    max_ngram_size=getattr(args, 'pld_max_ngram_size', 3),
+                    num_pred_tokens=getattr(args, 'pld_num_pred_tokens', 10),
+                    load_from=load_from
+                )
+            else:
+                self.init_retrieval_cache(
+                    cache_dir=getattr(args, 'retrieval_cache_dir', './retrieval_cache'),
+                    max_ngram_size=getattr(args, 'pld_max_ngram_size', 3),
+                    num_pred_tokens=getattr(args, 'pld_num_pred_tokens', 10),
+                    load_from=None
+                )
 
         self.draft_time = []
         self.target_time = []
@@ -82,6 +100,9 @@ class EvalHumaneval(Decoding):
         out_path = os.path.join(self.args.exp_name, f"{self.args.eval_mode}_humaneval.jsonl")
         out_f = open(out_path, "a")
         wall_times = {"time": [], "num_tokens": []}
+        
+        task_idx = 0  # 任务计数器（用于检索库）
+        
         for _ in range(self.args.num_samples_per_task):
             # set random seed. Ensure each experiment runs with a unique random seed.
             while self.seed in self.seed_set:
@@ -92,11 +113,21 @@ class EvalHumaneval(Decoding):
             for datum in tqdm.tqdm(self.data, total=len(self.data), disable=not self.accelerator.is_main_process,
                                    ncols=50):
                 input_ids = datum["input_ids"]
+                
+                # 检索库：任务开始回调
+                if self._use_retrieval_cache:
+                    self.on_task_start(task_idx, input_ids[0] if input_ids.dim() == 2 else input_ids)
+                
                 torch.cuda.synchronize()
                 start_time = time.time()
                 generate_ids = decoding(input_ids)
                 torch.cuda.synchronize()
                 end_time = time.time()
+                
+                # 检索库：任务结束回调
+                if self._use_retrieval_cache:
+                    self.on_task_end(generate_ids[0] if generate_ids.dim() == 2 else generate_ids)
+                
                 if self.accelerator.is_main_process:
                     wall_times["time"].append(end_time - start_time)
                     wall_times["num_tokens"].append(generate_ids.shape[1] - input_ids.shape[1])
@@ -105,6 +136,8 @@ class EvalHumaneval(Decoding):
                                             "new_tokens": generate_ids.shape[1] - input_ids.shape[1],
                                             "completion": output}, ensure_ascii=False) + "\n")
                 out_f.flush()
+                
+                task_idx += 1
 
         out_f.close()
 
@@ -129,6 +162,14 @@ class EvalHumaneval(Decoding):
                 self.color_print(f"Mean accepted tokens: {sum(self.num_acc_tokens) / len(self.num_acc_tokens)}")
             except:
                 pass
+        
+        # 保存检索库统计和缓存
+        if self._use_retrieval_cache and self.accelerator.is_main_process:
+            self.print_retrieval_stats()
+            if getattr(self.args, 'save_retrieval_cache', False):
+                cache_name = getattr(self.args, 'retrieval_cache_name', 'default')
+                self.save_retrieval_cache(f"{cache_name}_after_eval")
+                self.color_print(f"Retrieval cache saved as '{cache_name}_after_eval'", 2)
 
 
 if __name__ == "__main__":
