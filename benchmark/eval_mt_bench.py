@@ -33,23 +33,36 @@ class EvalMTBench(Decoding):
         self.load_data()
         self.load_model()
 
-        if "Llama-2" in self.args.draft_model and "Llama-2" in self.args.target_model:
+        if "llama2" in self.args.draft_model and "llama2" in self.args.target_model:
             self.model_id = "llama-2-chat"
         elif "vicuna" in self.args.draft_model and "vicuna" in self.args.target_model:
             self.model_id = "vicuna"
-        elif "Qwen" in self.args.draft_model and "Qwen" in self.args.target_model:
+        elif "deepseek" in self.args.draft_model and "deepseek" in self.args.target_model:
+            self.model_id = "vicuna"
+        elif "qwen" in self.args.draft_model and "qwen" in self.args.target_model:
             self.model_id = "qwen"
-        elif "Llama-3" in self.args.draft_model and "Llama-3" in self.args.target_model:
+        elif "llama3" in self.args.draft_model and "llama3" in self.args.target_model:
             self.model_id = "llama-3.1"
         else:
             raise NotImplementedError
 
-        # Initialize retrieval cache if enabled
+        # 初始化检索库（如果启用）
         if getattr(args, 'use_retrieval_cache', False):
-            self.init_retrieval_cache(
-                ngram_n=getattr(args, 'retrieval_ngram_n', 2),
-                max_cache_size=getattr(args, 'retrieval_max_cache_size', 100000)
-            )
+            load_from = getattr(args, 'retrieval_cache_name', None)
+            if load_from and load_from != 'new':
+                self.init_retrieval_cache(
+                    cache_dir=getattr(args, 'retrieval_cache_dir', './retrieval_cache'),
+                    max_ngram_size=getattr(args, 'pld_max_ngram_size', 3),
+                    num_pred_tokens=getattr(args, 'pld_num_pred_tokens', 10),
+                    load_from=load_from
+                )
+            else:
+                self.init_retrieval_cache(
+                    cache_dir=getattr(args, 'retrieval_cache_dir', './retrieval_cache'),
+                    max_ngram_size=getattr(args, 'pld_max_ngram_size', 3),
+                    num_pred_tokens=getattr(args, 'pld_num_pred_tokens', 10),
+                    load_from=None
+                )
 
     def load_data(self):
         # * load evaluation data
@@ -87,6 +100,8 @@ class EvalMTBench(Decoding):
         out_path = os.path.join(self.args.exp_name, f"{self.args.eval_mode}_mt_bench.jsonl")
         out_f = open(out_path, "a")
         
+        task_idx = 0  # 任务计数器（用于检索库）
+        
         for question in tqdm.tqdm(self.data, total=len(self.data), disable=not self.accelerator.is_main_process, ncols=50):
             
             choices = []
@@ -102,8 +117,7 @@ class EvalMTBench(Decoding):
                         {"role": "system",
                          "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
                     ]
-                elif self.model_id == "qwen": # <<< CHANGE HERE
-                    # Qwen 也需要一个 messages 列表来跟踪多轮对话
+                elif self.model_id == "qwen":
                     messages = []
                 else:     
                     conv = get_conversation_template(self.model_id)
@@ -130,14 +144,12 @@ class EvalMTBench(Decoding):
                         input_ids = torch.tensor(self.tokenizer([prompt],add_special_tokens=False,).input_ids)
                         
                     elif self.model_id == "qwen":
-                        # <<< ENTIRE BLOCK MODIFIED
-                        # 将当前用户问题添加到对话历史
                         messages.append({"role": "user", "content": qs})
                         prompt = self.tokenizer.apply_chat_template(
-                            messages, # <<< 使用完整的 messages 历史
+                            messages,
                             tokenize=False,
                             add_generation_prompt=True,
-                            enable_thinking=False, # 保持你原来的设置
+                            enable_thinking=False,
                         )
                         input_ids = torch.tensor(self.tokenizer([prompt],add_special_tokens=False,).input_ids)
                     
@@ -147,9 +159,9 @@ class EvalMTBench(Decoding):
                         prompt = conv.get_prompt() + " "
                         input_ids = torch.tensor(self.tokenizer.encode(prompt)).unsqueeze(0)
 
-                    # Start retrieval cache task
+                    # 检索库：任务开始回调
                     if self._use_retrieval_cache:
-                        self.on_task_start()
+                        self.on_task_start(task_idx, input_ids[0] if input_ids.dim() == 2 else input_ids)
 
                     torch.cuda.synchronize()
                     start_time = time.time()
@@ -157,9 +169,9 @@ class EvalMTBench(Decoding):
                     torch.cuda.synchronize()
                     end_time = time.time()
                     
-                    # End retrieval cache task
+                    # 检索库：任务结束回调
                     if self._use_retrieval_cache:
-                        self.on_task_end(output_ids, input_ids.shape[1])
+                        self.on_task_end(output_ids[0] if output_ids.dim() == 2 else output_ids)
                     
                     output_text = self.tokenizer.decode(output_ids[0], spaces_between_special_tokens=False)
                     
@@ -176,8 +188,7 @@ class EvalMTBench(Decoding):
                             "role": "assistant",
                             "content": output_text
                         })
-                    elif self.model_id == "qwen": # <<< CHANGE HERE
-                        # 为 qwen 添加专用的分支来保存历史
+                    elif self.model_id == "qwen":
                         messages.append({
                             "role": "assistant",
                             "content": output_text
@@ -188,6 +199,9 @@ class EvalMTBench(Decoding):
                     turns.append(output_text)
                     wall_time.append(end_time - start_time)
                     num_token.append(output_ids.shape[1] - input_ids.shape[1])
+                    
+                    task_idx += 1  # 每个turn都是一个独立任务
+                    
                 choices.append({"index": i, "wall_time": wall_time, "num_token": num_token, "turns": turns})
 
             ans_json = {
@@ -239,15 +253,16 @@ class EvalMTBench(Decoding):
             except:
                 pass
         
-        # Print retrieval cache statistics and save if enabled
+        # 保存检索库统计和缓存
         if self._use_retrieval_cache and self.accelerator.is_main_process:
             self.print_retrieval_stats()
             if getattr(self.args, 'save_retrieval_cache', False):
-                self.save_retrieval_cache(f"mt_bench_{self.args.eval_mode}")
+                cache_name = getattr(self.args, 'retrieval_cache_name', 'default')
+                self.save_retrieval_cache(f"{cache_name}_mt_bench_after_eval")
+                self.color_print(f"Retrieval cache saved as '{cache_name}_mt_bench_after_eval'", 2)
         
 
 if __name__ == "__main__":
     args = parse_arguments()
     alg = EvalMTBench(args)
     alg.eval()
-    
